@@ -213,20 +213,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = 2
 		rf.voteFor = -1
 	}
-	if rf.voteFor == args.CandidateId || rf.voteFor == -1 {
-		rf.lastContact = time.Now().UnixNano()
-		rf.voteFor = args.CandidateId
-		DPrintf("[server %v, role %v, term %v], vote for [%v]\n", rf.me, rf.state, rf.currentTerm, args.CandidateId)
-		reply.VoteGranted = true
-	} else {
+	if rf.voteFor!=args.CandidateId && rf.voteFor!=-1 {
 		reply.VoteGranted = false
+		return
 	}
+	lastLogIndex := len(rf.logs)-1
+	var lastLogTerm int
+	if lastLogIndex == -1 {
+		lastLogTerm = -1
+	} else {
+		lastLogTerm = rf.logs[lastLogIndex].Term
+	}
+	if lastLogTerm > args.LastLogTerm {
+		reply.VoteGranted = false
+		return
+	}
+	if lastLogIndex > args.LastLogIndex {
+		reply.VoteGranted = false
+		return
+	}
+	rf.lastContact = time.Now().UnixNano()
+	rf.voteFor = args.CandidateId
+	DPrintf("[server %v, role %v, term %v], vote for [%v]\n", rf.me, rf.state, rf.currentTerm, args.CandidateId)
+	reply.VoteGranted = true
 }
 
 
@@ -332,11 +348,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialization for leader election
 	rf.currentTerm = 0
 	rf.state = 2
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rand.Seed(time.Now().Unix())
 	rf.voteFor = -1
 	rf.lastContact = 0
 	// create a goroutine to start leader election
-	go rf.schedule()
+	go rf.election()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -345,9 +363,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft)schedule()  {
+func (rf *Raft) election()  {
 	// one loop represents an identity switch
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
@@ -362,7 +380,7 @@ func (rf *Raft)schedule()  {
 }
 
 // TODO: add cond primitive
-func (rf *Raft)follower() {
+func (rf *Raft) follower() {
 	rf.electionTimeout = 300 + rand.Intn(150)
 	DPrintf("[server %v, role %v, term %v]: change to follower, sleep [%v]\n", rf.me ,rf.state, rf.currentTerm, rf.electionTimeout)
 	rf.mu.Lock()
@@ -376,7 +394,7 @@ func (rf *Raft)follower() {
 		if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
 			break
 		}
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	DPrintf("[server %v, role %v, term %v] election timeout\n", rf.me, rf.state, rf.currentTerm)
 	rf.mu.Lock()
@@ -413,7 +431,7 @@ func (rf *Raft)candidate() {
 					if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
 						break
 					}
-					time.Sleep(1 * time.Millisecond)
+					time.Sleep(10 * time.Millisecond)
 				}
 			}
 		}
@@ -421,6 +439,12 @@ func (rf *Raft)candidate() {
 }
 
 func (rf *Raft)leader() {
+	logNums := len(rf.logs)
+	for i:=0; i<len(rf.peers); i++ {
+		rf.nextIndex = append(rf.nextIndex, logNums)
+		rf.matchIndex = append(rf.matchIndex, 0)
+	}
+
 	end := make(chan struct{})
 	go monitor(rf, end, 0)
 	for {
@@ -469,11 +493,18 @@ func (rf *Raft)collectEnoughVotes() bool {
 	votes := 1
 	finish := 1
 	rf.mu.Lock()
+	var lastLogTerm int
+	lastLogIndex := len(rf.logs)-1
+	if lastLogIndex == -1 {
+		lastLogTerm = -1
+	} else {
+		lastLogTerm = rf.logs[lastLogIndex].Term
+	}
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: 0,
-		LastLogTerm:  0,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 	rf.mu.Unlock()
 	for i:=0; i<len(rf.peers); i++ {
@@ -524,6 +555,6 @@ func monitor(rf *Raft, end chan struct{}, state int)  {
 			end <- struct {}{}
 			return
 		}
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
