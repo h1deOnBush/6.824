@@ -17,14 +17,18 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
 
-
+const heartbeatTime = 125
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +47,13 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Entry struct {
+	Command interface{}
+	Term int
+}
+
+
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,6 +68,22 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// 0 leader 1 candidate 2 follower
+	state int
+	lastContact int64
+	// Persistent state
+	currentTerm int
+	voteFor int
+	logs []Entry
+
+	// volatile state
+	commitIndex int
+	lastApplied int
+	electionTimeout int
+
+	// volatile state on leaders
+	nextIndex []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -66,6 +93,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	if rf.state == 0 {
+		isleader = true
+	}
 	return term, isleader
 }
 
@@ -108,8 +142,43 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []Entry
+	LeaderCommit int
+}
 
 
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		DPrintf("[server %v, state %v, term %v] receive past heartbeat from %v", rf.me, rf.state, rf.currentTerm, args.LeaderId)
+		reply.Success = false
+	} else {
+		reply.Term = args.Term
+		rf.lastContact = time.Now().UnixNano()
+		DPrintf("[server %v, state %v, term %v] receive success heartbeat from %v", rf.me, rf.state, rf.currentTerm, args.LeaderId)
+		reply.Success = true
+	}
+}
+
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -117,6 +186,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -125,6 +198,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -132,7 +207,28 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = 2
+		rf.voteFor = -1
+	}
+	if rf.voteFor == args.CandidateId || rf.voteFor == -1 {
+		rf.lastContact = time.Now().UnixNano()
+		rf.voteFor = args.CandidateId
+		DPrintf("[server %v, role %v, term %v], vote for [%v]\n", rf.me, rf.state, rf.currentTerm, args.CandidateId)
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
 }
+
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -232,12 +328,202 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
+	// initialization for leader election
+	rf.currentTerm = 0
+	rf.state = 2
+	rand.Seed(time.Now().Unix())
+	rf.voteFor = -1
+	rf.lastContact = 0
+	// create a goroutine to start leader election
+	go rf.schedule()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+}
+
+func (rf *Raft)schedule()  {
+	// one loop represents an identity switch
+	for {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+		if state == 2 {
+			rf.follower()
+		} else if state == 1 {
+			rf.candidate()
+		} else {
+			rf.leader()
+		}
+	}
+}
+
+// TODO: add cond primitive
+func (rf *Raft)follower() {
+	rf.electionTimeout = 300 + rand.Intn(150)
+	DPrintf("[server %v, role %v, term %v]: change to follower, sleep [%v]\n", rf.me ,rf.state, rf.currentTerm, rf.electionTimeout)
+	rf.mu.Lock()
+	rf.lastContact = time.Now().UnixNano()
+	rf.mu.Unlock()
+	for {
+		// wait election timeout
+		rf.mu.Lock()
+		lastContact := rf.lastContact
+		rf.mu.Unlock()
+		if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	DPrintf("[server %v, role %v, term %v] election timeout\n", rf.me, rf.state, rf.currentTerm)
+	rf.mu.Lock()
+	rf.state = 1
+	rf.mu.Unlock()
+}
+
+func (rf *Raft)candidate() {
+	end := make(chan struct{})
+	go monitor(rf, end, 1)
+	for {
+		select {
+		case <-end:
+			return
+		default:
+			rf.mu.Lock()
+			rf.currentTerm += 1
+			rf.voteFor = rf.me
+			DPrintf("[server %v, role %v, term %v]: vote for self:[%v]", rf.me, rf.state, rf.currentTerm, rf.me)
+			rf.mu.Unlock()
+			if rf.collectEnoughVotes() {
+				return
+			} else {
+				rf.electionTimeout = 300 + rand.Intn(150)
+				DPrintf("[server %v, role %v, term %v] not get enough votes, sleep [%v]", rf.me, rf.state, rf.currentTerm, rf.electionTimeout)
+				rf.mu.Lock()
+				rf.lastContact = time.Now().UnixNano()
+				rf.mu.Unlock()
+				for {
+					// wait election timeout
+					rf.mu.Lock()
+					lastContact := rf.lastContact
+					rf.mu.Unlock()
+					if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
+						break
+					}
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft)leader() {
+	end := make(chan struct{})
+	go monitor(rf, end, 0)
+	for {
+		select {
+		case <-end:
+			return
+		default:
+			rf.sendHeartbeat()
+			time.Sleep(heartbeatTime * time.Millisecond)
+		}
+	}
+}
+
+func (rf *Raft)sendHeartbeat() {
+	rf.mu.Lock()
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      nil,
+		LeaderCommit: 0,
+	}
+	rf.mu.Unlock()
+	for i:=0; i<len(rf.peers); i++ {
+		if i != rf.me {
+			reply := &AppendEntriesReply{}
+			go func(i int) {
+				//DPrintf("[server %v, role %v, term %v] send heartbeat to %v", rf.me, rf.state, rf.currentTerm, i)
+				if ok := rf.sendAppendEntries(i, args, reply); ok {
+					rf.mu.Lock()
+					if reply.Term>rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.state = 2
+					}
+					rf.mu.Unlock()
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft)collectEnoughVotes() bool {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	votes := 1
+	finish := 1
+	rf.mu.Lock()
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	rf.mu.Unlock()
+	for i:=0; i<len(rf.peers); i++ {
+		if i != rf.me {
+			reply := &RequestVoteReply{
+				Term:        0,
+				VoteGranted: false,
+			}
+			go func(i int) {
+				ok:=rf.sendRequestVote(i, args, reply)
+				mu.Lock()
+				if ok{
+					if reply.VoteGranted {
+						votes++
+						DPrintf("[server %v, role %v, term %v], receive votes from [%v]", rf.me, rf.state, rf.currentTerm, i)
+					}
+				}
+				finish++
+				DPrintf("[server %v, role %v, term %v]: finish send requestVote to [%v]", rf.me, rf.state, rf.currentTerm, i)
+				cond.Broadcast()
+				mu.Unlock()
+			}(i)
+		}
+	}
+	mu.Lock()
+	for votes <= len(rf.peers)/2 && finish != len(rf.peers)-1 {
+		cond.Wait()
+	}
+	if votes > len(rf.peers)/2 {
+		DPrintf("[server %v, role %v, term %v], get majority votes\n", rf.me, rf.state, rf.currentTerm)
+		rf.mu.Lock()
+		rf.state = 0
+		rf.mu.Unlock()
+		return true
+	}
+	mu.Unlock()
+	return false
+}
+
+// Monitor state change, once the state changed, then send signal to the end execute procedure
+// TODO: cond primitive
+func monitor(rf *Raft, end chan struct{}, state int)  {
+	for {
+		rf.mu.Lock()
+		s := rf.state
+		rf.mu.Unlock()
+		if s != state {
+			end <- struct {}{}
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 }
