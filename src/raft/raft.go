@@ -155,6 +155,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+
+	// for optimize
+	UnmatchedTerm int
+	FirstIdxOfUnmatchedTerm int
 }
 
 // TODO reduce the granularity of lock
@@ -166,7 +170,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 
 	reply.Term = rf.currentTerm
-
+	reply.UnmatchedTerm = -1
+	reply.FirstIdxOfUnmatchedTerm = -1
 	if rf.currentTerm > args.Term {
 		DPrintf("[server %v, role %v, term %v] leader [%v] term is smaller\n", rf.me, rf.state, rf.currentTerm, args.LeaderId)
 		reply.Success = false
@@ -177,6 +182,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// can't find a entry that has same index and term with args, return false
 	if args.PrevLogIndex>=len(rf.logs) || rf.logs[args.PrevLogIndex].Term!=args.PrevLogTerm {
 		reply.Success = false
+		if args.PrevLogIndex < len(rf.logs) {
+			unmatchedTerm := rf.logs[args.PrevLogIndex].Term
+			reply.UnmatchedTerm = unmatchedTerm
+			var i int
+			for i=args.PrevLogIndex-1; i>=0; i-- {
+				if rf.logs[i].Term != unmatchedTerm {
+					break
+				}
+			}
+			reply.FirstIdxOfUnmatchedTerm = i+1
+		}
 		DPrintf("[server %v, role %v, term %v] inconsistent entry in preLogIndex(%v), need to decrease\n", rf.me, rf.state, rf.currentTerm, args.PrevLogIndex)
 		return
 	}
@@ -205,9 +221,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if len(args.Entries) == 0 {
-		DPrintf("[server %v, role %v, term %v] receive successful heartbeat from %v", rf.me, rf.state, rf.currentTerm, args.LeaderId)
+		DPrintf("[server %v, role %v, term %v] receive successful heartbeat from [%v]", rf.me, rf.state, rf.currentTerm, args.LeaderId)
 	} else {
-		DPrintf("[server %v, role %v, term %v] Append Entry successfully from %v", rf.me, rf.state, rf.currentTerm, args.LeaderId)
+		DPrintf("[server %v, role %v, term %v] Append Entry successfully from [%v]", rf.me, rf.state, rf.currentTerm, args.LeaderId)
 	}
 	reply.Success = true
 }
@@ -410,7 +426,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	// create a goroutine to start leader election
-	go rf.election()
+	go rf.run()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -419,7 +435,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) election()  {
+func (rf *Raft) run()  {
 	// one loop represents an identity switch
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -542,7 +558,7 @@ func (rf *Raft) sendHeartbeat() {
 				if rf.sendAppendEntries(i, args, reply) {
 					rf.mu.Lock()
 					if reply.Success {
-						DPrintf("[server %v, role %v, term %v] receive append entry response", rf.me, rf.state, rf.currentTerm)
+						DPrintf("[server %v, role %v, term %v] receive append entry response from [%v]", rf.me, rf.state, rf.currentTerm, i)
 						rf.nextIndex[i] = args.PrevLogIndex+len(args.Entries)+1
 						rf.matchIndex[i] = rf.nextIndex[i]-1
 						// update committed
@@ -568,7 +584,11 @@ func (rf *Raft) sendHeartbeat() {
 						} else {
 							// can't find a entry that has same index and term with args, decrease prevLogIndex
 							DPrintf("[server %v, role %v, term %v] inconsistent entry send to [%v], now to decrease preLogIndex", rf.me, rf.state, rf.currentTerm, i)
-							rf.nextIndex[i]--
+							if reply.FirstIdxOfUnmatchedTerm != -1 {
+								rf.nextIndex[i] = reply.FirstIdxOfUnmatchedTerm
+							} else {
+								rf.nextIndex[i]--
+							}
 						}
 					}
 					rf.mu.Unlock()
@@ -633,7 +653,7 @@ func (rf *Raft) collectEnoughVotes() bool {
 
 func (rf *Raft) setCommitIndexAndApply(commitIndex int)  {
 	rf.commitIndex = commitIndex
-	// apply to state machine
+	// apply to state machine, with a new goroutine
 	if rf.commitIndex > rf.lastApplied {
 		DPrintf("[server %v, role %v, term %v], apply log from %v to %v\n", rf.me, rf.state, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
 		entriesToApply := append([]Entry{}, rf.logs[(rf.lastApplied+1):(rf.commitIndex+1)]...)

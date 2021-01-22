@@ -164,6 +164,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	DPrintf("server [%v] disconnect\n", (leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
@@ -175,6 +176,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	DPrintf("server [%v] reconnect\n", (leader + 1) % servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve

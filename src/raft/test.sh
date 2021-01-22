@@ -6,6 +6,8 @@ if [ $# -ne 2 ]; then
 	exit 1
 fi
 for ((i=0;i<$2;i++))
+
 do
+  echo $i
 	go test -run $1
 done
