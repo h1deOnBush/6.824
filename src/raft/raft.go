@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"../labgob"
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -28,7 +31,11 @@ import "../labrpc"
 // import "bytes"
 // import "../labgob"
 
-const heartbeatTime = 100
+const (
+	heartbeatTime = 100
+	electionTimeoutLower = 300
+	randomSection = 150
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -70,7 +77,7 @@ type Raft struct {
 
 	// 0 leader 1 candidate 2 follower
 	state int
-	lastContact int64
+	tick int64
 	// Persistent state
 	currentTerm int
 	voteFor int
@@ -111,12 +118,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -129,17 +137,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, voteFor int
+	var logs []Entry
+	if d.Decode(&currentTerm) != nil ||
+	   	d.Decode(&voteFor) != nil || d.Decode(&logs) != nil {
+		fmt.Println("readPersist error")
+	} else {
+		rf.mu.Lock()
+	  	rf.currentTerm = currentTerm
+	  	rf.logs = logs
+	  	rf.voteFor = voteFor
+		rf.mu.Unlock()
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -157,41 +168,42 @@ type AppendEntriesReply struct {
 	Success bool
 
 	// for optimize
-	UnmatchedTerm int
-	FirstIdxOfUnmatchedTerm int
+	ConflictTerm int
+	ConflictIndex int
 }
 
 // TODO reduce the granularity of lock
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 	rf.mu.Lock()
 	defer func() {
-		rf.lastContact = time.Now().UnixNano()
+		rf.persist()
 		rf.mu.Unlock()
 	}()
 
 	reply.Term = rf.currentTerm
-	reply.UnmatchedTerm = -1
-	reply.FirstIdxOfUnmatchedTerm = -1
+	reply.ConflictTerm = -1
+	reply.ConflictIndex = -1
 	if rf.currentTerm > args.Term {
 		DPrintf("[server %v, role %v, term %v] leader [%v] term is smaller\n", rf.me, rf.state, rf.currentTerm, args.LeaderId)
 		reply.Success = false
 		return
+	} else if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.state = 2
 	}
-	rf.currentTerm = args.Term
-	rf.state = 2
 	// can't find a entry that has same index and term with args, return false
 	if args.PrevLogIndex>=len(rf.logs) || rf.logs[args.PrevLogIndex].Term!=args.PrevLogTerm {
 		reply.Success = false
 		if args.PrevLogIndex < len(rf.logs) {
-			unmatchedTerm := rf.logs[args.PrevLogIndex].Term
-			reply.UnmatchedTerm = unmatchedTerm
+			conflictTerm := rf.logs[args.PrevLogIndex].Term
+			reply.ConflictTerm = conflictTerm
 			var i int
 			for i=args.PrevLogIndex-1; i>=0; i-- {
-				if rf.logs[i].Term != unmatchedTerm {
+				if rf.logs[i].Term != conflictTerm {
 					break
 				}
 			}
-			reply.FirstIdxOfUnmatchedTerm = i+1
+			reply.ConflictIndex = i+1
 		}
 		DPrintf("[server %v, role %v, term %v] inconsistent entry in preLogIndex(%v), need to decrease\n", rf.me, rf.state, rf.currentTerm, args.PrevLogIndex)
 		return
@@ -212,6 +224,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// truncate unmatch Follower entries, and apply Leader entries
 		rf.logs = rf.logs[:(args.PrevLogIndex + 1 + unmatch_idx)]
 		rf.logs = append(rf.logs, args.Entries[unmatch_idx:]...)
+		DPrintf("[server %v, role %v, term %v] Append Entry successfully from [%v], (%v)-(%v)", rf.me, rf.state, rf.currentTerm, args.LeaderId, args.PrevLogIndex + 1 + unmatch_idx, args.PrevLogIndex+len(args.Entries))
+	} else {
+		if len(args.Entries) == 0 {
+			DPrintf("[server %v, role %v, term %v] receive successful heartbeat from [%v]", rf.me, rf.state, rf.currentTerm, args.LeaderId)
+		} else {
+			DPrintf("[server %v, role %v, term %v] Append Entry successfully from [%v], already have (%v)-(%v)", rf.me, rf.state, rf.currentTerm, args.LeaderId, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries))
+		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit > len(rf.logs)-1 {
@@ -220,11 +239,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.setCommitIndexAndApply(args.LeaderCommit)
 		}
 	}
-	if len(args.Entries) == 0 {
-		DPrintf("[server %v, role %v, term %v] receive successful heartbeat from [%v]", rf.me, rf.state, rf.currentTerm, args.LeaderId)
-	} else {
-		DPrintf("[server %v, role %v, term %v] Append Entry successfully from [%v]", rf.me, rf.state, rf.currentTerm, args.LeaderId)
-	}
+	rf.state = 2
+	rf.tick = time.Now().UnixNano()
 	reply.Success = true
 }
 
@@ -262,7 +278,10 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		rf.persist()
+		rf.mu.Unlock()
+	}()
 
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -277,7 +296,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.voteFor!=args.CandidateId && rf.voteFor!=-1 {
 		reply.VoteGranted = false
-		DPrintf("[server %v, role %v, term %v] reject vote for [%v], already voted for another", rf.me, rf.state, rf.currentTerm, args.CandidateId)
+		DPrintf("[server %v, role %v, term %v] reject vote for [%v], already voted for [%v]", rf.me, rf.state, rf.currentTerm, args.CandidateId, rf.voteFor)
 		return
 	}
 	lastLogIndex := len(rf.logs)-1
@@ -293,7 +312,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
-	rf.lastContact = time.Now().UnixNano()
+	rf.electionTimeout = electionTimeoutLower + rand.Intn(randomSection)
+	rf.tick = time.Now().UnixNano()
 	rf.voteFor = args.CandidateId
 	DPrintf("[server %v, role %v, term %v], vote for [%v]\n", rf.me, rf.state, rf.currentTerm, args.CandidateId)
 	reply.VoteGranted = true
@@ -364,6 +384,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		DPrintf("[server %v, role %v, term %v] receive command(%v) from client", rf.me, rf.state, rf.currentTerm, command)
 		rf.logs = append(rf.logs, Entry{Command: command, Term: term})
+		rf.persist()
 		index = len(rf.logs) - 1
 		// why this step
 		rf.matchIndex[rf.me] = index
@@ -422,7 +443,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = []Entry{{Term: -1}}
 	rand.Seed(time.Now().UnixNano())
 	rf.voteFor = -1
-	rf.lastContact = 0
+	rf.tick = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	// create a goroutine to start leader election
@@ -451,60 +472,78 @@ func (rf *Raft) run()  {
 	}
 }
 
+func (rf *Raft) restartTimer() int64 {
+	rf.electionTimeout = electionTimeoutLower + rand.Intn(randomSection)
+	rf.mu.Lock()
+	lastTick := time.Now().UnixNano()
+	rf.tick = lastTick
+	rf.mu.Unlock()
+	return lastTick
+}
+
+//func (rf *Raft) timeout(ch chan struct{}) {
+//	for {
+//		// wait election timeout
+//		rf.mu.Lock()
+//		if time.Now().UnixNano()-rf.tick >= int64(rf.electionTimeout*1000000) {
+//				rf.mu.Unlock()
+//				ch <- struct{}{}
+//				return
+//		}
+//		rf.mu.Unlock()
+//		time.Sleep(10 * time.Millisecond)
+//	}
+//}
+
 // TODO: add cond primitive
 func (rf *Raft) follower() {
-	rf.electionTimeout = 3*heartbeatTime + rand.Intn(150)
-	//DPrintf("[server %v, role %v, term %v]: change to follower, sleep [%v]\n", rf.me ,rf.state, rf.currentTerm, rf.electionTimeout)
-	rf.mu.Lock()
-	rf.lastContact = time.Now().UnixNano()
-	rf.mu.Unlock()
+	lastTick := rf.restartTimer()
 	for {
 		// wait election timeout
 		rf.mu.Lock()
-		lastContact := rf.lastContact
-		rf.mu.Unlock()
-		if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
-			break
+		if rf.tick != lastTick {
+			rf.electionTimeout = electionTimeoutLower + rand.Intn(randomSection)
+			lastTick = rf.tick
+		} else {
+			if time.Now().UnixNano()-rf.tick >= int64(rf.electionTimeout*1000000) {
+				rf.mu.Unlock()
+				break
+			}
 		}
+		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 	rf.mu.Lock()
-	rf.state = 1
 	DPrintf("[server %v, role %v, term %v] election timeout, change to candidate\n", rf.me, rf.state, rf.currentTerm)
+	rf.state = 1
 	rf.mu.Unlock()
 }
 
 func (rf *Raft) candidate() {
 	end := make(chan struct{})
-	go monitor(rf, end, 1)
+	rf.restartTimer()
+	go rf.monitor(end, 1)
+	voting := false
 	for {
 		select {
 		case <-end:
 			return
 		default:
-			rf.mu.Lock()
-			rf.currentTerm += 1
-			rf.voteFor = rf.me
-			DPrintf("[server %v, role %v, term %v]: vote for self:[%v]", rf.me, rf.state, rf.currentTerm, rf.me)
-			rf.mu.Unlock()
-			if rf.collectEnoughVotes() {
-				return
-			} else {
-				rf.electionTimeout = 3*heartbeatTime + rand.Intn(150)
-				DPrintf("[server %v, role %v, term %v] not get enough votes, sleep [%v]", rf.me, rf.state, rf.currentTerm, rf.electionTimeout)
+			if !voting {
 				rf.mu.Lock()
-				rf.lastContact = time.Now().UnixNano()
+				rf.currentTerm += 1
+				rf.voteFor = rf.me
+				rf.persist()
+				DPrintf("[server %v, role %v, term %v]: vote for self:[%v]", rf.me, rf.state, rf.currentTerm, rf.me)
 				rf.mu.Unlock()
-				for {
-					// wait election timeout
-					rf.mu.Lock()
-					lastContact := rf.lastContact
-					rf.mu.Unlock()
-					if time.Now().UnixNano()-lastContact >= int64(rf.electionTimeout*1000000) {
-						break
-					}
-					time.Sleep(10 * time.Millisecond)
+				if rf.collectEnoughVotes() {
+					return
+				} else {
+					DPrintf("[server %v, role %v, term %v] not get enough votes", rf.me, rf.state, rf.currentTerm)
+					voting = true
 				}
+			} else {
+				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}
@@ -518,7 +557,7 @@ func (rf *Raft) leader() {
 	}
 
 	end := make(chan struct{})
-	go monitor(rf, end, 0)
+	go rf.monitor(end, 0)
 	for {
 		select {
 		case <-end:
@@ -558,7 +597,7 @@ func (rf *Raft) sendHeartbeat() {
 				if rf.sendAppendEntries(i, args, reply) {
 					rf.mu.Lock()
 					if reply.Success {
-						DPrintf("[server %v, role %v, term %v] receive append entry response from [%v]", rf.me, rf.state, rf.currentTerm, i)
+						DPrintf("[server %v, role %v, term %v] receive successful append entry response from [%v]", rf.me, rf.state, rf.currentTerm, i)
 						rf.nextIndex[i] = args.PrevLogIndex+len(args.Entries)+1
 						rf.matchIndex[i] = rf.nextIndex[i]-1
 						// update committed
@@ -580,12 +619,13 @@ func (rf *Raft) sendHeartbeat() {
 						if reply.Term > rf.currentTerm {
 							DPrintf("[server %v, role %v, term %v] leader term is obsolete, change to follower", rf.me, rf.state, rf.currentTerm)
 							rf.currentTerm = reply.Term
+							rf.persist()
 							rf.state = 2
 						} else {
 							// can't find a entry that has same index and term with args, decrease prevLogIndex
 							DPrintf("[server %v, role %v, term %v] inconsistent entry send to [%v], now to decrease preLogIndex", rf.me, rf.state, rf.currentTerm, i)
-							if reply.FirstIdxOfUnmatchedTerm != -1 {
-								rf.nextIndex[i] = reply.FirstIdxOfUnmatchedTerm
+							if reply.ConflictIndex != -1 {
+								rf.nextIndex[i] = reply.ConflictIndex
 							} else {
 								rf.nextIndex[i]--
 							}
@@ -593,7 +633,7 @@ func (rf *Raft) sendHeartbeat() {
 					}
 					rf.mu.Unlock()
 				} else {
-					DPrintf("[server %v, role %v, term %v] not receive response from [%v] for append entry", rf.me, state, currentTerm, i)
+					DPrintf("[server %v, role %v, term %v] not receive response from [%v] for append entry, delay or drop may happen", rf.me, state, currentTerm, i)
 				}
 			}(i)
 		}
@@ -624,11 +664,21 @@ func (rf *Raft) collectEnoughVotes() bool {
 				DPrintf("[server %v, role %v, term %v], send request vote to [%v]", rf.me, rf.state, rf.currentTerm, i)
 				ok := rf.sendRequestVote(i, args, reply)
 				mu.Lock()
-				if ok {
+				if ok  {
 					if reply.VoteGranted {
 						votes++
 						DPrintf("[server %v, role %v, term %v], receive votes from [%v]", rf.me, rf.state, rf.currentTerm, i)
+					} else {
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.persist()
+							rf.state = 2
+						}
+						rf.mu.Unlock()
 					}
+				} else {
+					DPrintf("[server %v, role %v, term %v] not receive vote response from [%v], drop or delay may happens", rf.me, rf.state, rf.currentTerm, i)
 				}
 				finish++
 				cond.Broadcast()
@@ -678,15 +728,24 @@ func (rf *Raft) setCommitIndexAndApply(commitIndex int)  {
 
 // Monitor state change, once the state changed, then send signal to the end execute procedure
 // TODO: cond primitive
-func monitor(rf *Raft, end chan struct{}, state int)  {
+func (rf *Raft) monitor(end chan struct{}, state int)  {
 	for {
 		rf.mu.Lock()
 		s := rf.state
-		rf.mu.Unlock()
 		if s != state {
+			rf.mu.Unlock()
 			end <- struct {}{}
 			return
 		}
+		if s!=0 {
+			if time.Now().UnixNano()-rf.tick >= int64(rf.electionTimeout*1000000) {
+				DPrintf("[server %v, role %v, term %v] election timeout, start new election", rf.me, rf.state, rf.currentTerm)
+				rf.mu.Unlock()
+				end <- struct{}{}
+				return
+			}
+		}
+		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 }

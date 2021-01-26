@@ -417,7 +417,7 @@ func TestBackup2B(t *testing.T) {
 
 	time.Sleep(RaftElectionTimeout / 2)
 
-	DPrintf("leader disconnect\n")
+	DPrintf("leader [%v] disconnect\n", leader1)
 	cfg.disconnect((leader1 + 0) % servers)
 	DPrintf("server [%v] disconnect\n", (leader1+1)%servers)
 	cfg.disconnect((leader1 + 1) % servers)
@@ -730,15 +730,18 @@ func TestFigure82C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8")
 
+	DPrintf("client send a random command\n")
 	cfg.one(rand.Int(), 1, true)
 
 	nup := servers
+	DPrintf("1000 loops\n")
 	for iters := 0; iters < 1000; iters++ {
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
 				if ok {
+					DPrintf("leader is [%v]", leader)
 					leader = i
 				}
 			}
@@ -753,6 +756,7 @@ func TestFigure82C(t *testing.T) {
 		}
 
 		if leader != -1 {
+			DPrintf("leader [%v] crash, get out", leader)
 			cfg.crash1(leader)
 			nup -= 1
 		}
@@ -793,16 +797,20 @@ func TestUnreliableAgree2C(t *testing.T) {
 			wg.Add(1)
 			go func(iters, j int) {
 				defer wg.Done()
+				DPrintf("client send a command(%v) to server\n", (100*iters)+j)
 				cfg.one((100*iters)+j, 1, true)
 			}(iters, j)
 		}
+		DPrintf("client send a command(%v) to server\n", iters)
 		cfg.one(iters, 1, true)
 	}
 
+	DPrintf("network become reliable\n")
 	cfg.setunreliable(false)
 
 	wg.Wait()
 
+	DPrintf("client send a command(100) to server\n")
 	cfg.one(100, servers, true)
 
 	cfg.end()
