@@ -240,6 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	rf.state = 2
+	rf.electionTimeout = electionTimeoutLower + rand.Intn(randomSection)
 	rf.tick = time.Now().UnixNano()
 	reply.Success = true
 }
@@ -502,7 +503,6 @@ func (rf *Raft) follower() {
 		// wait election timeout
 		rf.mu.Lock()
 		if rf.tick != lastTick {
-			rf.electionTimeout = electionTimeoutLower + rand.Intn(randomSection)
 			lastTick = rf.tick
 		} else {
 			if time.Now().UnixNano()-rf.tick >= int64(rf.electionTimeout*1000000) {
@@ -539,7 +539,6 @@ func (rf *Raft) candidate() {
 				if rf.collectEnoughVotes() {
 					return
 				} else {
-					DPrintf("[server %v, role %v, term %v] not get enough votes", rf.me, rf.state, rf.currentTerm)
 					voting = true
 				}
 			} else {
@@ -590,9 +589,9 @@ func (rf *Raft) sendHeartbeat() {
 			reply := &AppendEntriesReply{}
 			go func(i int) {
 				if len(entries) == 0 {
-					DPrintf("[server %v, role %v, term %v] send heartbeat to [%v]", rf.me, rf.state, rf.currentTerm, i)
+					DPrintf("[server %v, role %v, term %v] send heartbeat to [%v]", rf.me, state, currentTerm, i)
 				} else {
-					DPrintf("[server %v, role %v, term %v] Append entry to [%v] from %v to %v", rf.me, rf.state, rf.currentTerm, i, prevLogIndex+1, prevLogIndex+len(entries))
+					DPrintf("[server %v, role %v, term %v] Append entry to [%v] from %v to %v", rf.me, state, currentTerm, i, prevLogIndex+1, prevLogIndex+len(entries))
 				}
 				if rf.sendAppendEntries(i, args, reply) {
 					rf.mu.Lock()
@@ -647,8 +646,10 @@ func (rf *Raft) collectEnoughVotes() bool {
 	finish := 1
 	rf.mu.Lock()
 	lastLogIndex := len(rf.logs)-1
+	state := rf.state
+	currentTerm := rf.currentTerm
 	args := &RequestVoteArgs {
-		Term:         rf.currentTerm,
+		Term:         currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  rf.logs[lastLogIndex].Term,
@@ -656,18 +657,15 @@ func (rf *Raft) collectEnoughVotes() bool {
 	rf.mu.Unlock()
 	for i:=0; i<len(rf.peers); i++ {
 		if i != rf.me {
-			reply := &RequestVoteReply{
-				Term:        0,
-				VoteGranted: false,
-			}
 			go func(i int) {
-				DPrintf("[server %v, role %v, term %v], send request vote to [%v]", rf.me, rf.state, rf.currentTerm, i)
+				DPrintf("[server %v, role %v, term %v], send request vote to [%v]", rf.me, state, currentTerm, i)
+				reply := &RequestVoteReply{}
 				ok := rf.sendRequestVote(i, args, reply)
 				mu.Lock()
 				if ok  {
 					if reply.VoteGranted {
 						votes++
-						DPrintf("[server %v, role %v, term %v], receive votes from [%v]", rf.me, rf.state, rf.currentTerm, i)
+						DPrintf("[server %v, role %v, term %v], receive votes from [%v]", rf.me, state, currentTerm, i)
 					} else {
 						rf.mu.Lock()
 						if reply.Term > rf.currentTerm {
@@ -678,7 +676,7 @@ func (rf *Raft) collectEnoughVotes() bool {
 						rf.mu.Unlock()
 					}
 				} else {
-					DPrintf("[server %v, role %v, term %v] not receive vote response from [%v], drop or delay may happens", rf.me, rf.state, rf.currentTerm, i)
+					DPrintf("[server %v, role %v, term %v] not receive vote response from [%v], drop or delay may happens", rf.me, state, currentTerm, i)
 				}
 				finish++
 				cond.Broadcast()
@@ -691,13 +689,14 @@ func (rf *Raft) collectEnoughVotes() bool {
 		cond.Wait()
 	}
 	if votes > len(rf.peers)/2 {
-		DPrintf("[server %v, role %v, term %v], get majority votes\n", rf.me, rf.state, rf.currentTerm)
+		DPrintf("[server %v, role %v, term %v], get majority votes\n", rf.me, state, currentTerm)
 		rf.mu.Lock()
 		rf.state = 0
 		rf.mu.Unlock()
 		return true
 	}
 	mu.Unlock()
+	DPrintf("[server %v, role %v, term %v] not get enough votes\n", rf.me, state, currentTerm)
 	return false
 }
 
