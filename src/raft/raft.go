@@ -192,19 +192,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = 2
 	}
 	// can't find a entry that has same index and term with args, return false
-	if args.PrevLogIndex>=len(rf.logs) || rf.logs[args.PrevLogIndex].Term!=args.PrevLogTerm {
+	if args.PrevLogIndex>=len(rf.logs) {
 		reply.Success = false
-		if args.PrevLogIndex < len(rf.logs) {
-			conflictTerm := rf.logs[args.PrevLogIndex].Term
-			reply.ConflictTerm = conflictTerm
-			var i int
-			for i=args.PrevLogIndex-1; i>=0; i-- {
-				if rf.logs[i].Term != conflictTerm {
-					break
-				}
-			}
-			reply.ConflictIndex = i+1
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
+		return
+	}
+	if rf.logs[args.PrevLogIndex].Term!=args.PrevLogTerm {
+		reply.Success = false
+		conflictTerm := rf.logs[args.PrevLogIndex].Term
+		reply.ConflictTerm = conflictTerm
+		conflictIndex := args.PrevLogIndex
+		for rf.logs[conflictIndex-1].Term == conflictTerm {
+			conflictIndex--
 		}
+		reply.ConflictIndex = conflictIndex
 		DPrintf("[server %v, role %v, term %v] inconsistent entry in preLogIndex(%v), need to decrease\n", rf.me, rf.state, rf.currentTerm, args.PrevLogIndex)
 		return
 	}
@@ -577,7 +579,7 @@ func (rf *Raft) sendHeartbeat() {
 			state := rf.state
 			entries := make([]Entry, len(rf.logs[(prevLogIndex+1):]))
 			copy(entries, rf.logs[(prevLogIndex+1):])
-			args := &AppendEntriesArgs {
+			args := AppendEntriesArgs {
 				Term:         currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
@@ -586,14 +588,14 @@ func (rf *Raft) sendHeartbeat() {
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
-			reply := &AppendEntriesReply{}
 			go func(i int) {
+				var reply AppendEntriesReply
 				if len(entries) == 0 {
 					DPrintf("[server %v, role %v, term %v] send heartbeat to [%v]", rf.me, state, currentTerm, i)
 				} else {
 					DPrintf("[server %v, role %v, term %v] Append entry to [%v] from %v to %v", rf.me, state, currentTerm, i, prevLogIndex+1, prevLogIndex+len(entries))
 				}
-				if rf.sendAppendEntries(i, args, reply) {
+				if rf.sendAppendEntries(i, &args, &reply) {
 					rf.mu.Lock()
 					if reply.Success {
 						DPrintf("[server %v, role %v, term %v] receive successful append entry response from [%v]", rf.me, rf.state, rf.currentTerm, i)
@@ -623,11 +625,7 @@ func (rf *Raft) sendHeartbeat() {
 						} else {
 							// can't find a entry that has same index and term with args, decrease prevLogIndex
 							DPrintf("[server %v, role %v, term %v] inconsistent entry send to [%v], now to decrease preLogIndex", rf.me, rf.state, rf.currentTerm, i)
-							if reply.ConflictIndex != -1 {
-								rf.nextIndex[i] = reply.ConflictIndex
-							} else {
-								rf.nextIndex[i]--
-							}
+							rf.nextIndex[i] = reply.ConflictIndex
 						}
 					}
 					rf.mu.Unlock()
