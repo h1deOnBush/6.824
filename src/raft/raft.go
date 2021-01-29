@@ -501,7 +501,7 @@ func (rf *Raft) restartTimer() int64 {
 // TODO: add cond primitive
 func (rf *Raft) follower() {
 	lastTick := rf.restartTimer()
-	for {
+	for !rf.killed() {
 		// wait election timeout
 		rf.mu.Lock()
 		if rf.tick != lastTick {
@@ -595,8 +595,14 @@ func (rf *Raft) sendHeartbeat() {
 				} else {
 					DPrintf("[server %v, role %v, term %v] Append entry to [%v] from %v to %v", rf.me, state, currentTerm, i, prevLogIndex+1, prevLogIndex+len(entries))
 				}
-				if rf.sendAppendEntries(i, &args, &reply) {
-					rf.mu.Lock()
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				rf.mu.Lock()
+				currentTerm = rf.currentTerm
+				if currentTerm != args.Term {
+					rf.mu.Unlock()
+					return
+				}
+				if ok {
 					if reply.Success {
 						DPrintf("[server %v, role %v, term %v] receive successful append entry response from [%v]", rf.me, rf.state, rf.currentTerm, i)
 						rf.nextIndex[i] = args.PrevLogIndex+len(args.Entries)+1
@@ -628,10 +634,10 @@ func (rf *Raft) sendHeartbeat() {
 							rf.nextIndex[i] = reply.ConflictIndex
 						}
 					}
-					rf.mu.Unlock()
 				} else {
 					DPrintf("[server %v, role %v, term %v] not receive response from [%v] for append entry, delay or drop may happen", rf.me, state, currentTerm, i)
 				}
+				rf.mu.Unlock()
 			}(i)
 		}
 	}
@@ -646,7 +652,7 @@ func (rf *Raft) collectEnoughVotes() bool {
 	lastLogIndex := len(rf.logs)-1
 	state := rf.state
 	currentTerm := rf.currentTerm
-	args := &RequestVoteArgs {
+	args := RequestVoteArgs {
 		Term:         currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
@@ -657,9 +663,16 @@ func (rf *Raft) collectEnoughVotes() bool {
 		if i != rf.me {
 			go func(i int) {
 				DPrintf("[server %v, role %v, term %v], send request vote to [%v]", rf.me, state, currentTerm, i)
-				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(i, args, reply)
+				var reply RequestVoteReply
+				ok := rf.sendRequestVote(i, &args, &reply)
 				mu.Lock()
+				rf.mu.Lock()
+				currentTerm = args.Term
+				rf.mu.Unlock()
+				if currentTerm != args.Term {
+					mu.Unlock()
+					return
+				}
 				if ok  {
 					if reply.VoteGranted {
 						votes++
@@ -670,6 +683,9 @@ func (rf *Raft) collectEnoughVotes() bool {
 							rf.currentTerm = reply.Term
 							rf.persist()
 							rf.state = 2
+							rf.mu.Unlock()
+							mu.Unlock()
+							return
 						}
 						rf.mu.Unlock()
 					}
