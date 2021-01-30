@@ -142,13 +142,13 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm, voteFor int
 	var logs []Entry
 	if d.Decode(&currentTerm) != nil ||
-	   	d.Decode(&voteFor) != nil || d.Decode(&logs) != nil {
+		d.Decode(&voteFor) != nil || d.Decode(&logs) != nil {
 		fmt.Println("readPersist error")
 	} else {
 		rf.mu.Lock()
-	  	rf.currentTerm = currentTerm
-	  	rf.logs = logs
-	  	rf.voteFor = voteFor
+		rf.currentTerm = currentTerm
+		rf.logs = logs
+		rf.voteFor = voteFor
 		rf.mu.Unlock()
 	}
 }
@@ -551,12 +551,13 @@ func (rf *Raft) candidate() {
 }
 
 func (rf *Raft) leader() {
+	rf.mu.Lock()
 	logNums := len(rf.logs)
 	for i:=0; i<len(rf.peers); i++ {
 		rf.nextIndex[i] = logNums
 		rf.matchIndex[i] = 0
 	}
-
+	rf.mu.Unlock()
 	end := make(chan struct{})
 	go rf.monitor(end, 0)
 	for {
@@ -666,13 +667,6 @@ func (rf *Raft) collectEnoughVotes() bool {
 				var reply RequestVoteReply
 				ok := rf.sendRequestVote(i, &args, &reply)
 				mu.Lock()
-				rf.mu.Lock()
-				currentTerm = args.Term
-				rf.mu.Unlock()
-				if currentTerm != args.Term {
-					mu.Unlock()
-					return
-				}
 				if ok  {
 					if reply.VoteGranted {
 						votes++
