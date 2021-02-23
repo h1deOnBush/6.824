@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	"../labgob"
+	"6.824/labgob"
 	"bytes"
 	"fmt"
 	"math/rand"
@@ -26,7 +26,7 @@ import (
 	"time"
 )
 import "sync/atomic"
-import "../labrpc"
+import "6.824/labrpc"
 
 // import "bytes"
 // import "../labgob"
@@ -52,13 +52,37 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+
+	// For 2D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 type Entry struct {
 	Command interface{}
 	Term int
 }
+//
+// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// have more recent info since it communicate the snapshot on applyCh.
+//
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
+	// Your code here (2D).
+
+	return true
+}
+
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -666,6 +690,12 @@ func (rf *Raft) collectEnoughVotes() bool {
 				DPrintf("[server %v, role %v, term %v], send request vote to [%v]", rf.me, state, currentTerm, i)
 				var reply RequestVoteReply
 				ok := rf.sendRequestVote(i, &args, &reply)
+				rf.mu.Lock()
+				if args.Term != rf.currentTerm {
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
 				mu.Lock()
 				if ok  {
 					if reply.VoteGranted {
@@ -693,7 +723,7 @@ func (rf *Raft) collectEnoughVotes() bool {
 		}
 	}
 	mu.Lock()
-	for votes <= len(rf.peers)/2 && finish != len(rf.peers)-1 {
+	for votes <= len(rf.peers)/2 && finish != len(rf.peers) {
 		cond.Wait()
 	}
 	if votes > len(rf.peers)/2 {
@@ -701,6 +731,7 @@ func (rf *Raft) collectEnoughVotes() bool {
 		rf.mu.Lock()
 		rf.state = 0
 		rf.mu.Unlock()
+		mu.Unlock()
 		return true
 	}
 	mu.Unlock()
